@@ -519,31 +519,44 @@ function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 async function loadPrices() {
   if (!portfolio.length) return;
   document.getElementById('lastUpdate').textContent = 'Actualizando precios...';
-  const tickers = portfolio.map(p => p.ticker).join(',');
 
-  // Prices via Yahoo Finance
-  try {
-    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`);
+  // CORS proxy so it works from GitHub Pages and local files
+  const PROXY = 'https://api.allorigins.win/get?url=';
+  async function yFetch(url) {
+    const r = await fetch(PROXY + encodeURIComponent(url));
     const j = await r.json();
-    (j.spark?.result || []).forEach(s => {
-      const p = portfolio.find(x => x.ticker === s.symbol);
-      const price = s.response?.[0]?.meta?.regularMarketPrice;
-      if (p && price) p.price = price;
+    return JSON.parse(j.contents);
+  }
+
+  // Prices — v7 quote endpoint
+  try {
+    const tickers = portfolio.map(p => p.ticker).join(',');
+    const j = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice`);
+    (j.quoteResponse?.result || []).forEach(q => {
+      const p = portfolio.find(x => x.ticker === q.symbol);
+      if (p && q.regularMarketPrice) p.price = q.regularMarketPrice;
     });
-  } catch(e) {}
+  } catch(e) {
+    // Fallback spark endpoint
+    try {
+      const tickers = portfolio.map(p => p.ticker).join(',');
+      const j = await yFetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`);
+      (j.spark?.result || []).forEach(s => {
+        const p = portfolio.find(x => x.ticker === s.symbol);
+        const price = s.response?.[0]?.meta?.regularMarketPrice;
+        if (p && price) p.price = price;
+      });
+    } catch(e2) {}
+  }
 
   // FX rates
   try {
     const pairs = 'EURUSD=X,EURGBP=X,EURJPY=X,EURHKD=X,EURCAD=X,EURCHF=X';
-    const r2 = await fetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${pairs}&range=1d&interval=1d`);
-    const j2 = await r2.json();
+    const j2 = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(pairs)}&fields=regularMarketPrice`);
     const map = {USD:'EURUSD=X',GBP:'EURGBP=X',JPY:'EURJPY=X',HKD:'EURHKD=X',CAD:'EURCAD=X',CHF:'EURCHF=X'};
-    (j2.spark?.result || []).forEach(s => {
-      const v = s.response?.[0]?.meta?.regularMarketPrice;
-      if (v) {
-        const cur = Object.entries(map).find(([,sym]) => sym === s.symbol)?.[0];
-        if (cur) fxRates[cur] = 1 / v;
-      }
+    (j2.quoteResponse?.result || []).forEach(q => {
+      const cur = Object.entries(map).find(([,s]) => s === q.symbol)?.[0];
+      if (cur && q.regularMarketPrice) fxRates[cur] = 1 / q.regularMarketPrice;
     });
   } catch(e) {}
 
@@ -751,14 +764,18 @@ async function loadHistorical() {
   const period = document.getElementById('evoPeriod').value;
   document.getElementById('evoLoading').style.display = 'flex';
 
+  const PROXY = 'https://api.allorigins.win/get?url=';
+  async function yFetchSpark(sym) {
+    const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(sym)}&range=${period}&interval=1wk`;
+    const r = await fetch(PROXY + encodeURIComponent(url));
+    const j = await r.json();
+    return JSON.parse(j.contents);
+  }
+
   try {
     let allDates = [], allVals = [];
     if (ticker === 'ALL') {
-      // Fetch each ticker
-      const responses = await Promise.all(portfolio.map(p =>
-        fetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(p.ticker)}&range=${period}&interval=1wk`)
-          .then(r => r.json()).catch(() => null)
-      ));
+      const responses = await Promise.all(portfolio.map(p => yFetchSpark(p.ticker).catch(() => null)));
       const dateMap = {};
       responses.forEach((j, i) => {
         const p = portfolio[i];
@@ -778,8 +795,7 @@ async function loadHistorical() {
     } else {
       const p = portfolio.find(x => x.ticker === ticker);
       if (!p) return;
-      const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(ticker)}&range=${period}&interval=1wk`);
-      const j = await r.json();
+      const j = await yFetchSpark(ticker);
       const res = j?.spark?.result?.[0]?.response?.[0];
       if (res) {
         const times = res.timestamp || [];
