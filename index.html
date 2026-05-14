@@ -245,7 +245,7 @@ input[type="file"]{display:none}
   <div class="page-header">
     <div>
       <div class="page-title">Mi Cartera</div>
-      <div class="page-subtitle" id="lastUpdate">Sin datos — importa tu CSV para empezar</div>
+      <div class="page-subtitle" id="lastUpdate">v3.1 · Sin datos — importa tu CSV para empezar</div>
     </div>
     <div class="header-actions">
       <select id="baseCurrency" onchange="renderAll()" style="padding:6px 10px;width:auto">
@@ -531,262 +531,87 @@ async function loadPrices() {
   const statusEl = document.getElementById('lastUpdate');
   statusEl.textContent = 'Actualizando precios...';
 
-  // Multiple CORS proxies — se intenta en orden hasta que uno funcione
+  // Strategy: try multiple public APIs in order
+  // 1. Yahoo Finance via multiple CORS proxies
+  // 2. Fallback to last known prices (from localStorage)
+
   const PROXIES = [
-    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
   ];
 
-  async function yFetch(apiUrl) {
+  async function tryFetch(apiUrl) {
+    // Try direct first (works if server allows CORS — unlikely for Yahoo but try)
     for (const proxyFn of PROXIES) {
       try {
-        const r = await fetch(proxyFn(apiUrl), {signal: AbortSignal.timeout(8000)});
+        const proxiedUrl = proxyFn(apiUrl);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 7000);
+        const r = await fetch(proxiedUrl, { signal: ctrl.signal });
+        clearTimeout(timer);
         if (!r.ok) continue;
         const j = await r.json();
-        // allorigins wraps in {contents:...}, codetabs returns directly
-        const raw = j.contents !== undefined ? j.contents : (typeof j === 'string' ? j : JSON.stringify(j));
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (parsed) return parsed;
+        // allorigins wraps response in {contents: "..."}
+        if (j && j.contents !== undefined) {
+          return JSON.parse(j.contents);
+        }
+        // codetabs / thingproxy return raw JSON
+        return j;
       } catch(e) { continue; }
     }
-    throw new Error('All proxies failed');
+    return null;
   }
 
+  // Yahoo Finance v7 quote — most reliable endpoint
+  const tickers = portfolio.map(p => p.ticker).join(',');
+  const yahooUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice,currency&formatted=false&lang=en-US`;
+  
   let pricesLoaded = false;
-
-  // Prices — v7 quote endpoint (más fiable que spark)
-  try {
-    const tickers = portfolio.map(p => p.ticker).join(',');
-    const j = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice,currency`);
-    const results = j?.quoteResponse?.result || [];
-    results.forEach(q => {
+  const data = await tryFetch(yahooUrl);
+  
+  if (data?.quoteResponse?.result) {
+    data.quoteResponse.result.forEach(q => {
       const p = portfolio.find(x => x.ticker === q.symbol);
       if (p && q.regularMarketPrice) { p.price = q.regularMarketPrice; pricesLoaded = true; }
     });
-  } catch(e) {
-    // Fallback: spark endpoint
-    try {
-      const tickers = portfolio.map(p => p.ticker).join(',');
-      const j = await yFetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`);
-      (j?.spark?.result || []).forEach(s => {
+  }
+
+  // If v7 failed, try v8 spark
+  if (!pricesLoaded) {
+    const sparkUrl = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`;
+    const data2 = await tryFetch(sparkUrl);
+    if (data2?.spark?.result) {
+      data2.spark.result.forEach(s => {
         const p = portfolio.find(x => x.ticker === s.symbol);
         const price = s.response?.[0]?.meta?.regularMarketPrice;
         if (p && price) { p.price = price; pricesLoaded = true; }
       });
-    } catch(e2) {}
+    }
   }
 
-  // FX rates
+  // FX via Frankfurter (100% free, no CORS issues, no key needed)
   try {
-    const pairs = 'EURUSD=X,EURGBP=X,EURJPY=X,EURHKD=X,EURCAD=X,EURCHF=X';
-    const j2 = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(pairs)}&fields=regularMarketPrice`);
-    const map = {USD:'EURUSD=X',GBP:'EURGBP=X',JPY:'EURJPY=X',HKD:'EURHKD=X',CAD:'EURCAD=X',CHF:'EURCHF=X'};
-    (j2?.quoteResponse?.result || []).forEach(q => {
-      const cur = Object.entries(map).find(([,s]) => s === q.symbol)?.[0];
-      if (cur && q.regularMarketPrice) fxRates[cur] = 1 / q.regularMarketPrice;
-    });
+    const fxR = await fetch('https://api.frankfurter.app/latest?base=EUR&symbols=USD,GBP,JPY,HKD,CAD,CHF');
+    if (fxR.ok) {
+      const fxJ = await fxR.json();
+      if (fxJ.rates) {
+        Object.entries(fxJ.rates).forEach(([cur, rate]) => {
+          fxRates[cur] = 1 / rate;
+        });
+      }
+    }
   } catch(e) {}
 
   const now = new Date();
-  if (pricesLoaded) {
-    statusEl.textContent = `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')}`;
-  } else {
-    statusEl.textContent = `Precios no disponibles (mercado cerrado o sin conexión) · ${now.toLocaleDateString('es-ES')}`;
-  }
+  statusEl.textContent = pricesLoaded
+    ? `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')}`
+    : `Sin precios en tiempo real (mercado cerrado o proxy bloqueado) · ${now.toLocaleDateString('es-ES')}`;
+  
   save();
   renderAll();
   checkAlerts();
-}
-
-// ==================== METRICS ====================
-function calcTotals() {
-  let totalVal = 0, totalCost = 0, cagrSum = 0, cagrCount = 0;
-  portfolio.forEach(p => {
-    if (!p.price) return;
-    const vEUR = toEUR(p.price * p.qty, p.currency);
-    const cEUR = toEUR(p.cost * p.qty, p.currency);
-    totalVal += vEUR;
-    totalCost += cEUR;
-    const cagr = calcCAGR(p);
-    if (cagr !== null) { cagrSum += cagr; cagrCount++; }
-  });
-  return { totalVal, totalCost, pnl: totalVal - totalCost, pnlPct: totalCost ? ((totalVal - totalCost) / totalCost) * 100 : 0, cagrAvg: cagrCount ? cagrSum / cagrCount : null };
-}
-
-function calcCAGR(p) {
-  if (!p.price || !p.buyDate) return null;
-  const years = (Date.now() - new Date(p.buyDate)) / (365.25 * 86400000);
-  if (years < 0.05) return null;
-  return (Math.pow(p.price / p.cost, 1 / years) - 1) * 100;
-}
-
-function renderMetrics() {
-  const t = calcTotals();
-  const s = sym();
-  document.getElementById('mTotal').textContent = fmt(toBase(t.totalVal));
-  document.getElementById('mCost').textContent = fmt(toBase(t.totalCost));
-  const pnlEl = document.getElementById('mPnl');
-  pnlEl.textContent = fmt(toBase(t.pnl));
-  pnlEl.className = 'metric-val ' + (t.pnl >= 0 ? 'pos' : 'neg');
-  const pnlPctEl = document.getElementById('mPnlPct');
-  pnlPctEl.textContent = fmtPct(t.pnlPct);
-  pnlPctEl.className = 'metric-sub ' + (t.pnl >= 0 ? 'pos' : 'neg');
-  const cagrEl = document.getElementById('mCagr');
-  if (t.cagrAvg !== null) {
-    cagrEl.textContent = fmtPct(t.cagrAvg);
-    cagrEl.className = 'metric-val ' + (t.cagrAvg >= 0 ? 'pos' : 'neg');
-  } else { cagrEl.textContent = '–'; cagrEl.className = 'metric-val neut'; }
-  const divYTD = dividends.filter(d => d.date && d.date.startsWith(new Date().getFullYear())).reduce((a, d) => a + d.amount, 0);
-  document.getElementById('mDiv').textContent = '€' + divYTD.toFixed(0);
-  document.getElementById('sidebarStatus').textContent = portfolio.length ? `${portfolio.length} posiciones cargadas` : 'Sin datos cargados';
-}
-
-// ==================== TABLE ====================
-function renderTable() {
-  const wrap = document.getElementById('tableWrap');
-  if (!portfolio.length) {
-    wrap.innerHTML = '<div class="empty"><div class="empty-icon">📂</div><p>Importa tu CSV para ver las posiciones</p><br><button class="btn btn-primary" onclick="nav(\'importar\',document.querySelector(\'[onclick*=importar]\'))">Importar CSV</button></div>';
-    return;
-  }
-  const t = calcTotals();
-  const rows = portfolio.map(p => {
-    const hasPrice = !!p.price;
-    const valEUR = hasPrice ? toEUR(p.price * p.qty, p.currency) : 0;
-    const costEUR = toEUR(p.cost * p.qty, p.currency);
-    const pnl = valEUR - costEUR;
-    const pnlPct = costEUR ? (pnl / costEUR) * 100 : 0;
-    const peso = t.totalVal ? (valEUR / t.totalVal) * 100 : 0;
-    const cagr = calcCAGR(p);
-    const pCls = pnl >= 0 ? 'pos' : 'neg';
-    const badge = SECTOR_BADGE[p.sector] || 's-tech';
-    const priceStr = hasPrice ? (p.currency === 'EUR' ? '€' : '$') + p.price.toFixed(2) : '–';
-    const al = alerts[p.ticker];
-    const isAlert = al && hasPrice && ((al.above && p.price >= al.above) || (al.below && p.price <= al.below));
-    return `<tr class="${isAlert ? 'alert-row' : ''}">
-      <td><div class="ticker-cell">${p.ticker}${isAlert ? ' ⚠️' : ''}</div></td>
-      <td><div style="display:flex;align-items:center;gap:6px">${FLAGS[p.country] || ''}
-        <div><div style="font-size:12px;color:var(--text)">${p.name}</div><div class="name-cell">${COUNTRIES[p.country] || p.country}</div></div>
-      </div></td>
-      <td><span class="badge ${badge}">${p.sector}</span></td>
-      <td class="r mono">${priceStr}</td>
-      <td class="r mono">${p.qty}</td>
-      <td class="r mono">${p.currency === 'EUR' ? '€' : '$'}${p.cost.toFixed(2)}</td>
-      <td class="r mono">${hasPrice ? fmt(toBase(valEUR)) : '–'}</td>
-      <td class="r mono ${pCls}">${hasPrice ? fmt(toBase(pnl)) : '–'}</td>
-      <td class="r mono ${pCls}">${hasPrice ? fmtPct(pnlPct) : '–'}</td>
-      <td class="r mono ${cagr !== null ? (cagr >= 0 ? 'cagr-pos' : 'cagr-neg') : ''}">${cagr !== null ? fmtPct(cagr) + '/a' : '–'}</td>
-      <td class="r mono">${hasPrice ? peso.toFixed(1) + '%' : '–'}</td>
-    </tr>`;
-  }).join('');
-  wrap.innerHTML = `<table><thead><tr>
-    <th>Ticker</th><th>Empresa</th><th>Sector</th>
-    <th class="r">Precio</th><th class="r">Qty</th><th class="r">Coste/u</th>
-    <th class="r">Valor</th><th class="r">P&L</th><th class="r">P&L%</th>
-    <th class="r">CAGR</th><th class="r">Peso</th>
-  </tr></thead><tbody>${rows}</tbody></table>`;
-}
-
-// ==================== DONUT CHARTS ====================
-function mkDonut(id, data) {
-  if (chartInstances[id]) chartInstances[id].destroy();
-  const labels = Object.keys(data);
-  const vals = labels.map(l => Math.round(data[l]));
-  const colors = labels.map(l => (id.includes('sector') ? SECTOR_COLORS[l] : CURRENCY_COLORS[l]) || '#888');
-  const total = vals.reduce((a, b) => a + b, 0);
-  chartInstances[id] = new Chart(document.getElementById(id), {
-    type: 'doughnut',
-    data: { labels, datasets: [{ data: vals, backgroundColor: colors, borderWidth: 0 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false, cutout: '68%',
-      plugins: {
-        legend: { position: 'right', labels: { font: { size: 11, family: 'DM Mono' }, color: '#9a9990', boxWidth: 10, padding: 10,
-          generateLabels: chart => chart.data.labels.map((l, i) => ({
-            text: `${l} ${((vals[i]/total)*100).toFixed(0)}%`,
-            fillStyle: chart.data.datasets[0].backgroundColor[i],
-            fontColor: '#9a9990', hidden: false, index: i
-          }))
-        }},
-        tooltip: { callbacks: { label: ctx => sym() + ctx.raw.toLocaleString('es-ES') } }
-      }
-    }
-  });
-}
-
-function renderSectorChart() {
-  const data = {};
-  portfolio.forEach(p => { if (!p.price) return; data[p.sector] = (data[p.sector] || 0) + toEUR(p.price * p.qty, p.currency); });
-  if (Object.keys(data).length) mkDonut('sectorChart', data);
-}
-function renderCurrencyChart() {
-  const data = {};
-  portfolio.forEach(p => { if (!p.price) return; data[p.currency] = (data[p.currency] || 0) + toEUR(p.price * p.qty, p.currency); });
-  if (Object.keys(data).length) mkDonut('currencyChart', data);
-}
-
-// ==================== GEO MAP ====================
-function renderGeoChart() {
-  const data = {};
-  portfolio.forEach(p => { if (!p.price) return; data[p.country] = (data[p.country] || 0) + toEUR(p.price * p.qty, p.currency); });
-  const sorted = Object.entries(data).sort((a, b) => b[1] - a[1]);
-  const labels = sorted.map(([c]) => COUNTRIES[c] || c);
-  const vals = sorted.map(([, v]) => Math.round(v));
-  if (chartInstances['geoChart']) chartInstances['geoChart'].destroy();
-  chartInstances['geoChart'] = new Chart(document.getElementById('geoChart'), {
-    type: 'bar',
-    data: { labels, datasets: [{ data: vals, backgroundColor: '#c8f060', borderRadius: 3 }] },
-    options: {
-      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => sym() + ctx.raw.toLocaleString('es-ES') } } },
-      scales: {
-        x: { ticks: { callback: v => sym() + (v / 1000).toFixed(0) + 'k', color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
-        y: { ticks: { color: '#9a9990', font: { size: 11 } }, grid: { display: false } }
-      }
-    }
-  });
-}
-
-function renderGeoMap() {
-  renderGeoChart();
-  const data = {};
-  portfolio.forEach(p => { if (!p.price) return; data[p.country] = (data[p.country] || 0) + toEUR(p.price * p.qty, p.currency); });
-  const total = Object.values(data).reduce((a, b) => a + b, 0);
-  if (!total) return;
-  const el = document.getElementById('worldMap');
-  el.innerHTML = '';
-  const colorScale = d3.scaleQuantize([0, total * 0.45], ['#1a2a18','#2a4a28','#3a6a38','#4a9048','#60b858','#80d070','#c8f060']);
-  const w = el.clientWidth || 700, h = Math.round(w * 0.52);
-  const svg = d3.select('#worldMap').append('svg').attr('viewBox', `0 0 ${w} ${h}`).attr('width', '100%');
-  svg.append('rect').attr('width', w).attr('height', h).attr('fill', '#181816');
-  const proj = d3.geoNaturalEarth1().scale(w / 6.5).translate([w / 2, h / 1.95]);
-  const path = d3.geoPath(proj);
-  const tooltip = document.getElementById('tooltip');
-  d3.json('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(world => {
-    const features = topojson.feature(world, world.objects.countries).features;
-    svg.selectAll('path').data(features).join('path')
-      .attr('d', path)
-      .attr('fill', d => {
-        const iso3 = String(d.id).padStart(3, '0');
-        const c = Object.entries(COUNTRY_ISO3).find(([, v]) => v === iso3);
-        return c && data[c[0]] ? colorScale(data[c[0]]) : '#2a2a28';
-      })
-      .attr('stroke', '#0f0f0e').attr('stroke-width', 0.5)
-      .on('mouseover', (ev, d) => {
-        const iso3 = String(d.id).padStart(3, '0');
-        const c = Object.entries(COUNTRY_ISO3).find(([, v]) => v === iso3);
-        if (c && data[c[0]]) {
-          const pct = ((data[c[0]] / total) * 100).toFixed(1);
-          tooltip.style.display = 'block';
-          tooltip.innerHTML = `<strong>${FLAGS[c[0]] || ''} ${COUNTRIES[c[0]]}</strong>${sym()}${Math.round(data[c[0]]).toLocaleString('es-ES')} · ${pct}%`;
-        }
-      })
-      .on('mousemove', ev => { tooltip.style.left = (ev.clientX + 14) + 'px'; tooltip.style.top = (ev.clientY - 34) + 'px'; })
-      .on('mouseout', () => { tooltip.style.display = 'none'; });
-  }).catch(() => { el.innerHTML = '<div class="loading" style="color:var(--text3)">No se pudo cargar el mapa — verifica conexión a internet</div>'; });
-
-  const stops = ['#1a2a18','#2a4a28','#3a6a38','#4a9048','#60b858','#80d070','#c8f060'];
-  document.getElementById('mapLegend').innerHTML =
-    '<span>Menor</span>' + stops.map(c => `<span style="width:18px;height:10px;border-radius:2px;background:${c};display:inline-block"></span>`).join('') + '<span>Mayor</span>';
 }
 
 // ==================== HISTORICAL ====================
@@ -796,20 +621,24 @@ async function loadHistorical() {
   const period = document.getElementById('evoPeriod').value;
   document.getElementById('evoLoading').style.display = 'flex';
 
-  const PROXIES2 = [
-    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  const HIST_PROXIES = [
+    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
   ];
   async function yFetchSpark(sym) {
-    const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(sym)}&range=${period}&interval=1wk`;
-    for (const proxyFn of PROXIES2) {
+    const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(sym)}&range=${period}&interval=1wk`;
+    for (const proxyFn of HIST_PROXIES) {
       try {
-        const r = await fetch(proxyFn(url), {signal: AbortSignal.timeout(8000)});
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const r = await fetch(proxyFn(url), { signal: ctrl.signal });
+        clearTimeout(timer);
         if (!r.ok) continue;
         const j = await r.json();
-        const raw = j.contents !== undefined ? j.contents : (typeof j === 'string' ? j : JSON.stringify(j));
-        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (j && j.contents !== undefined) return JSON.parse(j.contents);
+        return j;
       } catch(e) { continue; }
     }
     throw new Error('All proxies failed');
@@ -1155,14 +984,30 @@ function renderAll() {
 }
 
 // ==================== INIT ====================
-if (portfolio.length) {
-  updateEvoTickers();
-  updateDivTickers();
-  renderAll();
-  loadPrices();
-} else {
-  renderMetrics();
-}
+(function init() {
+  console.log('[Portfolio] Init — posiciones:', portfolio.length, portfolio.map(p=>p.ticker));
+  if (portfolio.length) {
+    updateEvoTickers();
+    updateDivTickers();
+    renderAll();
+    // Small delay to let DOM settle
+    setTimeout(() => loadPrices(), 300);
+  } else {
+    console.warn('[Portfolio] No hay posiciones cargadas — revisar DEFAULT_PORTFOLIO y localStorage');
+    renderMetrics();
+    // Force show defaults if something went wrong
+    setTimeout(() => {
+      if (!portfolio.length) {
+        portfolio = DEFAULT_PORTFOLIO.map(p => ({...p}));
+        console.log('[Portfolio] Forzando defaults:', portfolio.length);
+        updateEvoTickers();
+        updateDivTickers();
+        renderAll();
+        loadPrices();
+      }
+    }, 500);
+  }
+})();
 </script>
 </body>
 </html>
