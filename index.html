@@ -475,10 +475,20 @@ const DEFAULT_PORTFOLIO = [
   {ticker:'MCD',   name:'McDonald\'s',        country:'US', sector:'Consumo',     currency:'USD', qty:4,  cost:280.99,  buyDate:'2026-05-08', price:null},
   {ticker:'META',  name:'Meta Platforms',    country:'US', sector:'Tecnología',  currency:'USD', qty:2,  cost:600.00,  buyDate:'2026-05-12', price:null},
 ];
-// Usa localStorage si ya hay datos guardados, si no carga los defaults del CSV
-let portfolio = JSON.parse(localStorage.getItem('pf_portfolio') || 'null') || DEFAULT_PORTFOLIO;
-let dividends = JSON.parse(localStorage.getItem('pf_dividends') || '[]');
-let alerts = JSON.parse(localStorage.getItem('pf_alerts') || '{}');
+// Carga robusta: localStorage primero, defaults del CSV si no hay datos
+function loadStorage(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw || raw === 'null' || raw === 'undefined') return typeof fallback === 'function' ? fallback() : fallback;
+    const parsed = JSON.parse(raw);
+    if (parsed === null || parsed === undefined) return typeof fallback === 'function' ? fallback() : fallback;
+    if (Array.isArray(parsed) && parsed.length === 0 && !Array.isArray(fallback)) return typeof fallback === 'function' ? fallback() : fallback;
+    return parsed;
+  } catch(e) { return typeof fallback === 'function' ? fallback() : fallback; }
+}
+let portfolio = loadStorage('pf_portfolio', () => DEFAULT_PORTFOLIO.map(p => ({...p})));
+let dividends = loadStorage('pf_dividends', []);
+let alerts = loadStorage('pf_alerts', {});
 let fxRates = {EUR:1,USD:0.92,GBP:1.17,JPY:0.006,HKD:0.118,CAD:0.68,CHF:1.05};
 
 let pendingImport = null;
@@ -518,33 +528,51 @@ function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 
 async function loadPrices() {
   if (!portfolio.length) return;
-  document.getElementById('lastUpdate').textContent = 'Actualizando precios...';
+  const statusEl = document.getElementById('lastUpdate');
+  statusEl.textContent = 'Actualizando precios...';
 
-  // CORS proxy so it works from GitHub Pages and local files
-  const PROXY = 'https://api.allorigins.win/get?url=';
-  async function yFetch(url) {
-    const r = await fetch(PROXY + encodeURIComponent(url));
-    const j = await r.json();
-    return JSON.parse(j.contents);
+  // Multiple CORS proxies — se intenta en orden hasta que uno funcione
+  const PROXIES = [
+    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  ];
+
+  async function yFetch(apiUrl) {
+    for (const proxyFn of PROXIES) {
+      try {
+        const r = await fetch(proxyFn(apiUrl), {signal: AbortSignal.timeout(8000)});
+        if (!r.ok) continue;
+        const j = await r.json();
+        // allorigins wraps in {contents:...}, codetabs returns directly
+        const raw = j.contents !== undefined ? j.contents : (typeof j === 'string' ? j : JSON.stringify(j));
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (parsed) return parsed;
+      } catch(e) { continue; }
+    }
+    throw new Error('All proxies failed');
   }
 
-  // Prices — v7 quote endpoint
+  let pricesLoaded = false;
+
+  // Prices — v7 quote endpoint (más fiable que spark)
   try {
     const tickers = portfolio.map(p => p.ticker).join(',');
-    const j = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice`);
-    (j.quoteResponse?.result || []).forEach(q => {
+    const j = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice,currency`);
+    const results = j?.quoteResponse?.result || [];
+    results.forEach(q => {
       const p = portfolio.find(x => x.ticker === q.symbol);
-      if (p && q.regularMarketPrice) p.price = q.regularMarketPrice;
+      if (p && q.regularMarketPrice) { p.price = q.regularMarketPrice; pricesLoaded = true; }
     });
   } catch(e) {
-    // Fallback spark endpoint
+    // Fallback: spark endpoint
     try {
       const tickers = portfolio.map(p => p.ticker).join(',');
       const j = await yFetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`);
-      (j.spark?.result || []).forEach(s => {
+      (j?.spark?.result || []).forEach(s => {
         const p = portfolio.find(x => x.ticker === s.symbol);
         const price = s.response?.[0]?.meta?.regularMarketPrice;
-        if (p && price) p.price = price;
+        if (p && price) { p.price = price; pricesLoaded = true; }
       });
     } catch(e2) {}
   }
@@ -554,14 +582,18 @@ async function loadPrices() {
     const pairs = 'EURUSD=X,EURGBP=X,EURJPY=X,EURHKD=X,EURCAD=X,EURCHF=X';
     const j2 = await yFetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(pairs)}&fields=regularMarketPrice`);
     const map = {USD:'EURUSD=X',GBP:'EURGBP=X',JPY:'EURJPY=X',HKD:'EURHKD=X',CAD:'EURCAD=X',CHF:'EURCHF=X'};
-    (j2.quoteResponse?.result || []).forEach(q => {
+    (j2?.quoteResponse?.result || []).forEach(q => {
       const cur = Object.entries(map).find(([,s]) => s === q.symbol)?.[0];
       if (cur && q.regularMarketPrice) fxRates[cur] = 1 / q.regularMarketPrice;
     });
   } catch(e) {}
 
   const now = new Date();
-  document.getElementById('lastUpdate').textContent = `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')}`;
+  if (pricesLoaded) {
+    statusEl.textContent = `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')}`;
+  } else {
+    statusEl.textContent = `Precios no disponibles (mercado cerrado o sin conexión) · ${now.toLocaleDateString('es-ES')}`;
+  }
   save();
   renderAll();
   checkAlerts();
@@ -764,12 +796,23 @@ async function loadHistorical() {
   const period = document.getElementById('evoPeriod').value;
   document.getElementById('evoLoading').style.display = 'flex';
 
-  const PROXY = 'https://api.allorigins.win/get?url=';
+  const PROXIES2 = [
+    url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  ];
   async function yFetchSpark(sym) {
     const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(sym)}&range=${period}&interval=1wk`;
-    const r = await fetch(PROXY + encodeURIComponent(url));
-    const j = await r.json();
-    return JSON.parse(j.contents);
+    for (const proxyFn of PROXIES2) {
+      try {
+        const r = await fetch(proxyFn(url), {signal: AbortSignal.timeout(8000)});
+        if (!r.ok) continue;
+        const j = await r.json();
+        const raw = j.contents !== undefined ? j.contents : (typeof j === 'string' ? j : JSON.stringify(j));
+        return typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch(e) { continue; }
+    }
+    throw new Error('All proxies failed');
   }
 
   try {
