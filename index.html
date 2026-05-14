@@ -529,485 +529,137 @@ function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 async function loadPrices() {
   if (!portfolio.length) return;
   const statusEl = document.getElementById('lastUpdate');
-  statusEl.textContent = 'Actualizando precios...';
+  statusEl.textContent = 'Obteniendo precios...';
 
-  // Strategy: try multiple public APIs in order
-  // 1. Yahoo Finance via multiple CORS proxies
-  // 2. Fallback to last known prices (from localStorage)
-
-  const PROXIES = [
-    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
-  ];
-
-  async function tryFetch(apiUrl) {
-    // Try direct first (works if server allows CORS — unlikely for Yahoo but try)
-    for (const proxyFn of PROXIES) {
-      try {
-        const proxiedUrl = proxyFn(apiUrl);
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 7000);
-        const r = await fetch(proxiedUrl, { signal: ctrl.signal });
-        clearTimeout(timer);
-        if (!r.ok) continue;
-        const j = await r.json();
-        // allorigins wraps response in {contents: "..."}
-        if (j && j.contents !== undefined) {
-          return JSON.parse(j.contents);
-        }
-        // codetabs / thingproxy return raw JSON
-        return j;
-      } catch(e) { continue; }
-    }
-    return null;
-  }
-
-  // Yahoo Finance v7 quote — most reliable endpoint
-  const tickers = portfolio.map(p => p.ticker).join(',');
-  const yahooUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers)}&fields=regularMarketPrice,currency&formatted=false&lang=en-US`;
-  
-  let pricesLoaded = false;
-  const data = await tryFetch(yahooUrl);
-  
-  if (data?.quoteResponse?.result) {
-    data.quoteResponse.result.forEach(q => {
-      const p = portfolio.find(x => x.ticker === q.symbol);
-      if (p && q.regularMarketPrice) { p.price = q.regularMarketPrice; pricesLoaded = true; }
-    });
-  }
-
-  // If v7 failed, try v8 spark
-  if (!pricesLoaded) {
-    const sparkUrl = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(tickers)}&range=1d&interval=1d`;
-    const data2 = await tryFetch(sparkUrl);
-    if (data2?.spark?.result) {
-      data2.spark.result.forEach(s => {
-        const p = portfolio.find(x => x.ticker === s.symbol);
-        const price = s.response?.[0]?.meta?.regularMarketPrice;
-        if (p && price) { p.price = price; pricesLoaded = true; }
-      });
-    }
-  }
-
-  // FX via Frankfurter (100% free, no CORS issues, no key needed)
+  // FX via Frankfurter — sin CORS, sin key, siempre funciona
   try {
     const fxR = await fetch('https://api.frankfurter.app/latest?base=EUR&symbols=USD,GBP,JPY,HKD,CAD,CHF');
     if (fxR.ok) {
       const fxJ = await fxR.json();
       if (fxJ.rates) {
-        Object.entries(fxJ.rates).forEach(([cur, rate]) => {
-          fxRates[cur] = 1 / rate;
-        });
+        Object.entries(fxJ.rates).forEach(([cur, rate]) => { fxRates[cur] = 1 / rate; });
       }
     }
   } catch(e) {}
 
-  const now = new Date();
-  statusEl.textContent = pricesLoaded
-    ? `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')}`
-    : `Sin precios en tiempo real (mercado cerrado o proxy bloqueado) · ${now.toLocaleDateString('es-ES')}`;
-  
+  // Precios via Claude API con web search
+  const tickerList = portfolio.map(p => `${p.ticker} (${p.name})`).join(', ');
+  const prompt = `Give me the current market price for each of these stocks: ${tickerList}.
+Return ONLY a valid JSON object like this, no explanation, no markdown:
+{"BABA":92.5,"MSFT":420.1,"AMZN":192.3}
+Use the exact ticker symbols as keys. Use numbers only for values (USD or EUR price as traded on their exchange).`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 300,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      // Extract text from response (may be after tool use blocks)
+      const textBlock = data.content?.find(b => b.type === 'text');
+      if (textBlock?.text) {
+        const clean = textBlock.text.replace(/```json|```/g, '').trim();
+        const prices = JSON.parse(clean);
+        let loaded = 0;
+        portfolio.forEach(p => {
+          if (prices[p.ticker] !== undefined) { p.price = prices[p.ticker]; loaded++; }
+        });
+        const now = new Date();
+        statusEl.textContent = `Actualizado: ${now.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})} · ${now.toLocaleDateString('es-ES')} · ${loaded} precios cargados`;
+        save();
+        renderAll();
+        checkAlerts();
+        return;
+      }
+    }
+  } catch(e) { console.warn('Claude API price fetch failed:', e); }
+
+  // Fallback: mostrar posiciones con precios de coste si todo falla
+  statusEl.textContent = 'Precios no disponibles — mostrando valor a coste';
+  portfolio.forEach(p => { if (!p.price) p.price = p.cost; });
   save();
   renderAll();
   checkAlerts();
 }
+
 
 // ==================== HISTORICAL ====================
 async function loadHistorical() {
   if (!portfolio.length) return;
   const ticker = document.getElementById('evoTicker').value;
   const period = document.getElementById('evoPeriod').value;
-  document.getElementById('evoLoading').style.display = 'flex';
+  const loadingEl = document.getElementById('evoLoading');
+  loadingEl.style.display = 'flex';
 
-  const HIST_PROXIES = [
-    (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    (url) => `https://thingproxy.freeboard.io/fetch/${url}`,
-  ];
-  async function yFetchSpark(sym) {
-    const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(sym)}&range=${period}&interval=1wk`;
-    for (const proxyFn of HIST_PROXIES) {
-      try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 8000);
-        const r = await fetch(proxyFn(url), { signal: ctrl.signal });
-        clearTimeout(timer);
-        if (!r.ok) continue;
-        const j = await r.json();
-        if (j && j.contents !== undefined) return JSON.parse(j.contents);
-        return j;
-      } catch(e) { continue; }
-    }
-    throw new Error('All proxies failed');
-  }
+  // Map period to months for the prompt
+  const periodMap = {'6mo':'6 months','1y':'12 months','2y':'2 years','5y':'5 years'};
+  const periodLabel = periodMap[period] || '12 months';
+
+  const targetTickers = ticker === 'ALL' ? portfolio.map(p => p.ticker) : [ticker];
+  const names = targetTickers.map(t => { const p = portfolio.find(x => x.ticker === t); return `${t}${p ? ' ('+p.name+')' : ''}`; }).join(', ');
+
+  const prompt = ticker === 'ALL'
+    ? `Give me approximate monthly closing prices for the last ${periodLabel} for these stocks: ${names}.
+Return ONLY a JSON object like: {"2024-01":{"MSFT":400,"AMZN":180},"2024-02":{"MSFT":410,"AMZN":185}}
+Use YYYY-MM format for dates. Numbers only for prices in their native currency. No explanation, no markdown.`
+    : `Give me approximate weekly closing prices for the last ${periodLabel} for ${names}.
+Return ONLY a JSON array like: [{"date":"2024-01-05","price":180.5},{"date":"2024-01-12","price":183.2}]
+Use YYYY-MM-DD for dates. Numbers only. No explanation, no markdown.`;
 
   try {
-    let allDates = [], allVals = [];
-    if (ticker === 'ALL') {
-      const responses = await Promise.all(portfolio.map(p => yFetchSpark(p.ticker).catch(() => null)));
-      const dateMap = {};
-      responses.forEach((j, i) => {
-        const p = portfolio[i];
-        const res = j?.spark?.result?.[0]?.response?.[0];
-        if (!res) return;
-        const times = res.timestamp || [];
-        const closes = res.indicators?.quote?.[0]?.close || [];
-        times.forEach((t, ti) => {
-          const date = new Date(t * 1000).toISOString().substring(0, 10);
-          const priceEUR = toEUR((closes[ti] || p.price || p.cost), p.currency) * p.qty;
-          dateMap[date] = (dateMap[date] || 0) + priceEUR;
-        });
-      });
-      const sorted = Object.entries(dateMap).sort(([a], [b]) => a.localeCompare(b));
-      allDates = sorted.map(([d]) => d);
-      allVals = sorted.map(([, v]) => Math.round(toBase(v)));
-    } else {
-      const p = portfolio.find(x => x.ticker === ticker);
-      if (!p) return;
-      const j = await yFetchSpark(ticker);
-      const res = j?.spark?.result?.[0]?.response?.[0];
-      if (res) {
-        const times = res.timestamp || [];
-        const closes = res.indicators?.quote?.[0]?.close || [];
-        times.forEach((t, i) => {
-          allDates.push(new Date(t * 1000).toISOString().substring(0, 10));
-          allVals.push(+(closes[i] || p.price || p.cost).toFixed(2));
-        });
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const textBlock = data.content?.find(b => b.type === 'text');
+      if (textBlock?.text) {
+        const clean = textBlock.text.replace(/```json|```/g, '').trim();
+        const parsed = JSON.parse(clean);
+
+        let dates = [], vals = [];
+        if (ticker === 'ALL') {
+          // parsed = {"2024-01": {"MSFT": 400, ...}, ...}
+          const months = Object.keys(parsed).sort();
+          dates = months;
+          vals = months.map(m => {
+            let total = 0;
+            portfolio.forEach(p => {
+              const price = parsed[m]?.[p.ticker];
+              if (price) total += toEUR(price * p.qty, p.currency);
+            });
+            return Math.round(toBase(total));
+          });
+        } else {
+          // parsed = [{date, price}, ...]
+          const p = portfolio.find(x => x.ticker === ticker);
+          dates = parsed.map(d => d.date);
+          vals = parsed.map(d => d.price);
+        }
+        renderEvoChart(dates, vals, ticker);
       }
     }
-    renderEvoChart(allDates, allVals, ticker);
-  } catch(e) {}
-  document.getElementById('evoLoading').style.display = 'none';
+  } catch(e) { console.warn('Historical data fetch failed:', e); }
+
+  loadingEl.style.display = 'none';
   renderCAGRChart();
   renderPnLChart();
 }
 
-function renderEvoChart(dates, vals, ticker) {
-  if (chartInstances['evoChart']) chartInstances['evoChart'].destroy();
-  if (!dates || !dates.length) return;
-  const s = sym();
-  const first = vals[0], last = vals[vals.length - 1];
-  const color = last >= first ? '#c8f060' : '#f06060';
-  chartInstances['evoChart'] = new Chart(document.getElementById('evoChart'), {
-    type: 'line',
-    data: { labels: dates, datasets: [{ label: ticker === 'ALL' ? 'Cartera total' : ticker, data: vals, borderColor: color, backgroundColor: color + '18', fill: true, tension: 0.2, pointRadius: 0, borderWidth: 2 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => s + ctx.raw.toLocaleString('es-ES') } } },
-      scales: {
-        x: { ticks: { maxTicksLimit: 8, color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
-        y: { ticks: { callback: v => s + (v / 1000).toFixed(0) + 'k', color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
-      }
-    }
-  });
-}
 
-function renderCAGRChart() {
-  const items = portfolio.filter(p => calcCAGR(p) !== null);
-  const sorted = items.sort((a, b) => (calcCAGR(b) || 0) - (calcCAGR(a) || 0));
-  const labels = sorted.map(p => p.ticker);
-  const vals = sorted.map(p => +calcCAGR(p).toFixed(1));
-  if (chartInstances['cagrChart']) chartInstances['cagrChart'].destroy();
-  chartInstances['cagrChart'] = new Chart(document.getElementById('cagrChart'), {
-    type: 'bar',
-    data: { labels, datasets: [{ data: vals, backgroundColor: vals.map(v => v >= 0 ? '#c8f060' : '#f06060'), borderRadius: 3 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ctx.raw.toFixed(1) + '%/año' } } },
-      scales: {
-        x: { ticks: { color: '#9a9990', font: { size: 10 } }, grid: { display: false } },
-        y: { ticks: { callback: v => v + '%', color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
-      }
-    }
-  });
-}
-
-function renderPnLChart() {
-  const items = portfolio.filter(p => p.price);
-  const sorted = items.sort((a, b) => {
-    const pnlA = toEUR(p => p.price * p.qty, a.currency) - toEUR(a.cost * a.qty, a.currency);
-    const pnlB = toEUR(b.price * b.qty, b.currency) - toEUR(b.cost * b.qty, b.currency);
-    return pnlB - pnlA;
-  });
-  const labels = sorted.map(p => p.ticker);
-  const vals = sorted.map(p => Math.round(toBase(toEUR(p.price * p.qty, p.currency) - toEUR(p.cost * p.qty, p.currency))));
-  if (chartInstances['pnlChart']) chartInstances['pnlChart'].destroy();
-  const s = sym();
-  chartInstances['pnlChart'] = new Chart(document.getElementById('pnlChart'), {
-    type: 'bar',
-    data: { labels, datasets: [{ data: vals, backgroundColor: vals.map(v => v >= 0 ? '#c8f060' : '#f06060'), borderRadius: 3 }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => s + ctx.raw.toLocaleString('es-ES') } } },
-      scales: {
-        x: { ticks: { color: '#9a9990', font: { size: 10 } }, grid: { display: false } },
-        y: { ticks: { callback: v => s + (v / 1000).toFixed(0) + 'k', color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
-      }
-    }
-  });
-}
-
-// ==================== DIVIDENDS ====================
-function showAddDiv() {
-  const form = document.getElementById('addDivForm');
-  form.style.display = form.style.display === 'none' ? 'block' : 'none';
-  const sel = document.getElementById('divTicker');
-  sel.innerHTML = '<option value="">–</option>' + portfolio.map(p => `<option value="${p.ticker}">${p.ticker}</option>`).join('');
-}
-function saveDividend() {
-  const ticker = document.getElementById('divTicker').value;
-  const date = document.getElementById('divDate').value;
-  const amount = parseFloat(document.getElementById('divAmount').value);
-  if (!ticker || !date || isNaN(amount)) { toast('Rellena todos los campos'); return; }
-  dividends.push({ ticker, date, amount });
-  save();
-  document.getElementById('addDivForm').style.display = 'none';
-  renderDividends();
-  toast('Dividendo guardado');
-}
-function renderDividends() {
-  const total = dividends.reduce((a, d) => a + d.amount, 0);
-  const yr = new Date().getFullYear();
-  const ytd = dividends.filter(d => d.date && d.date.startsWith(yr)).reduce((a, d) => a + d.amount, 0);
-  document.getElementById('divTotalM').textContent = '€' + total.toFixed(2);
-  document.getElementById('divYTDM').textContent = '€' + ytd.toFixed(2);
-  const totalVal = portfolio.filter(p => p.price).reduce((a, p) => a + toEUR(p.price * p.qty, p.currency), 0);
-  document.getElementById('divYieldM').textContent = totalVal ? (ytd / totalVal * 100).toFixed(2) + '%' : '–';
-  document.getElementById('mDiv').textContent = '€' + ytd.toFixed(0);
-
-  // Table
-  const sorted = [...dividends].sort((a, b) => b.date?.localeCompare(a.date));
-  document.getElementById('divBody').innerHTML = sorted.map((d, i) => `<tr>
-    <td class="ticker-cell">${d.ticker}</td>
-    <td class="mono">${d.date ? new Date(d.date + 'T12:00').toLocaleDateString('es-ES') : '–'}</td>
-    <td class="r mono">€${d.amount.toFixed(2)}</td>
-    <td><button onclick="deleteDividend(${dividends.indexOf(d)})" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:14px" title="Eliminar">✕</button></td>
-  </tr>`).join('') || '<tr><td colspan="4" style="color:var(--text3);padding:1.5rem;text-align:center">Sin dividendos registrados</td></tr>';
-
-  // Charts
-  const monthly = {};
-  dividends.forEach(d => { const k = d.date?.substring(0, 7) || '?'; monthly[k] = (monthly[k] || 0) + d.amount; });
-  const mSorted = Object.keys(monthly).sort();
-  if (chartInstances['divBarChart']) chartInstances['divBarChart'].destroy();
-  chartInstances['divBarChart'] = new Chart(document.getElementById('divBarChart'), {
-    type: 'bar',
-    data: { labels: mSorted, datasets: [{ data: mSorted.map(k => +monthly[k].toFixed(2)), backgroundColor: '#40d0a0', borderRadius: 3 }] },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#5a5955', font: { size: 10 } }, grid: { display: false } }, y: { ticks: { callback: v => '€' + v, color: '#5a5955', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } } } }
-  });
-
-  const byTicker = {};
-  dividends.forEach(d => { byTicker[d.ticker] = (byTicker[d.ticker] || 0) + d.amount; });
-  const tickers = Object.keys(byTicker);
-  if (chartInstances['divDonutChart']) chartInstances['divDonutChart'].destroy();
-  chartInstances['divDonutChart'] = new Chart(document.getElementById('divDonutChart'), {
-    type: 'doughnut',
-    data: { labels: tickers, datasets: [{ data: tickers.map(t => +byTicker[t].toFixed(2)), backgroundColor: ['#c8f060','#60a8f0','#40d0a0','#f0a040','#a080f0','#f06090'], borderWidth: 0 }] },
-    options: { responsive: true, maintainAspectRatio: false, cutout: '65%', plugins: { legend: { position: 'right', labels: { color: '#9a9990', font: { size: 11 }, boxWidth: 10 } } } }
-  });
-}
-function deleteDividend(i) { dividends.splice(i, 1); save(); renderDividends(); }
-
-// ==================== ALERTS ====================
-function renderAlerts() {
-  if (!portfolio.length) { document.getElementById('alertList').innerHTML = '<div class="empty"><p>Carga posiciones primero</p></div>'; return; }
-  document.getElementById('alertList').innerHTML = portfolio.map(p => {
-    const al = alerts[p.ticker] || {};
-    return `<div class="alert-config ${al.above || al.below ? 'alert-active' : ''}" id="al-${p.ticker}">
-      <span class="ticker-cell" style="min-width:70px">${p.ticker}</span>
-      <span style="color:var(--text3);font-size:11px;flex:1">${p.name}</span>
-      <span style="color:var(--text3);font-size:11px">↑ sobre</span>
-      <input type="number" placeholder="–" step="0.01" value="${al.above || ''}" style="width:80px" onchange="setAlert('${p.ticker}','above',this.value)">
-      <span style="color:var(--text3);font-size:11px">↓ bajo</span>
-      <input type="number" placeholder="–" step="0.01" value="${al.below || ''}" style="width:80px" onchange="setAlert('${p.ticker}','below',this.value)">
-      <button onclick="clearAlert('${p.ticker}')" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:12px" title="Limpiar">✕</button>
-    </div>`;
-  }).join('');
-  checkAlerts();
-}
-function setAlert(ticker, type, val) {
-  if (!alerts[ticker]) alerts[ticker] = {};
-  if (val) alerts[ticker][type] = parseFloat(val);
-  else delete alerts[ticker][type];
-  save();
-}
-function clearAlert(ticker) {
-  delete alerts[ticker];
-  save();
-  renderAlerts();
-}
-function checkAlerts() {
-  const triggered = portfolio.filter(p => {
-    if (!p.price) return false;
-    const al = alerts[p.ticker];
-    return al && ((al.above && p.price >= al.above) || (al.below && p.price <= al.below));
-  });
-  const dot = document.getElementById('alertDot');
-  dot.style.display = triggered.length ? 'block' : 'none';
-  const box = document.getElementById('alertsTriggered');
-  const list = document.getElementById('alertsTriggeredList');
-  if (triggered.length) {
-    box.style.display = 'block';
-    list.innerHTML = triggered.map(p => {
-      const al = alerts[p.ticker];
-      const msgs = [];
-      if (al.above && p.price >= al.above) msgs.push(`precio ${p.price.toFixed(2)} ≥ alerta ${al.above} ↑`);
-      if (al.below && p.price <= al.below) msgs.push(`precio ${p.price.toFixed(2)} ≤ alerta ${al.below} ↓`);
-      return `<div class="alert-config alert-active"><span class="ticker-cell" style="min-width:70px">${p.ticker}</span><span style="color:var(--orange)">${msgs.join(' | ')}</span></div>`;
-    }).join('');
-  } else { box.style.display = 'none'; }
-}
-
-// ==================== IMPORT CSV ====================
-let pendingData = null;
-function handleDrop(ev) {
-  ev.preventDefault();
-  document.getElementById('dropZone').style.borderColor = '';
-  const file = ev.dataTransfer.files[0];
-  if (file) parseCSV(file);
-}
-function handleFileInput(ev) { const file = ev.target.files[0]; if (file) parseCSV(file); }
-function parseCSV(file) {
-  const reader = new FileReader();
-  reader.onload = e => {
-    const lines = e.target.result.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length < 2) { toast('CSV vacío o inválido'); return; }
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-    const rows = lines.slice(1).map(line => {
-      const cols = line.split(',');
-      const obj = {};
-      headers.forEach((h, i) => obj[h] = (cols[i] || '').trim());
-      return obj;
-    });
-    pendingData = rows;
-    // Preview
-    const ph = document.getElementById('previewHead');
-    const pb = document.getElementById('previewBody');
-    ph.innerHTML = '<tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr>';
-    pb.innerHTML = rows.slice(0, 5).map(r => '<tr>' + headers.map(h => `<td>${r[h] || ''}</td>`).join('') + '</tr>').join('');
-    document.getElementById('previewCard').style.display = 'block';
-  };
-  reader.readAsText(file);
-}
-function confirmImport() {
-  if (!pendingData) return;
-  portfolio = pendingData.map(r => ({
-    ticker: (r.ticker || '').toUpperCase(),
-    name: r.nombre || r.name || r.ticker,
-    country: (r.pais || r.country || r.país || 'US').toUpperCase().substring(0, 2),
-    sector: r.sector || 'Tecnología',
-    currency: (r.divisa || r.currency || 'EUR').toUpperCase(),
-    qty: parseFloat(r.cantidad || r.qty || r.quantity || 1),
-    cost: parseFloat(r.precio_coste || r.coste || r.cost || r.precio || 0),
-    buyDate: r.fecha_compra || r.fecha || r.date || null,
-    price: null
-  })).filter(p => p.ticker && p.qty > 0);
-  save();
-  updateEvoTickers();
-  updateDivTickers();
-  toast(`${portfolio.length} posiciones importadas`);
-  document.getElementById('previewCard').style.display = 'none';
-  pendingData = null;
-  loadPrices();
-  nav('cartera', document.querySelector('[onclick*="cartera"]'));
-}
-function cancelImport() { pendingData = null; document.getElementById('previewCard').style.display = 'none'; }
-
-function downloadTemplate() {
-  const csv = 'ticker,nombre,pais,sector,divisa,cantidad,precio_coste,fecha_compra\nASML,ASML Holding,NL,Tecnología,EUR,5,680,2022-03-15\nMSFT,Microsoft,US,Tecnología,USD,10,310,2021-11-01\nITX,Inditex,ES,Consumo,EUR,50,38,2023-06-10';
-  const a = document.createElement('a');
-  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
-  a.download = 'plantilla_cartera.csv';
-  a.click();
-}
-
-// ==================== CONFIG TABLE ====================
-function renderConfigTable() {
-  document.getElementById('configBody').innerHTML = portfolio.map((p, i) => `<tr>
-    <td><input value="${p.ticker}" onchange="portfolio[${i}].ticker=this.value.toUpperCase()" style="width:70px"></td>
-    <td><input value="${p.name}" onchange="portfolio[${i}].name=this.value" style="width:150px"></td>
-    <td><select onchange="portfolio[${i}].country=this.value" style="width:80px">${Object.keys(COUNTRIES).map(c => `<option value="${c}"${p.country===c?' selected':''}>${c}</option>`).join('')}</select></td>
-    <td><select onchange="portfolio[${i}].sector=this.value" style="width:130px">${SECTORS.map(s => `<option value="${s}"${p.sector===s?' selected':''}>${s}</option>`).join('')}</select></td>
-    <td><select onchange="portfolio[${i}].currency=this.value" style="width:75px">${CURRENCIES.map(c => `<option value="${c}"${p.currency===c?' selected':''}>${c}</option>`).join('')}</select></td>
-    <td class="r"><input type="number" value="${p.qty}" onchange="portfolio[${i}].qty=+this.value" style="width:60px;text-align:right"></td>
-    <td class="r"><input type="number" value="${p.cost}" step="0.01" onchange="portfolio[${i}].cost=+this.value" style="width:80px;text-align:right"></td>
-    <td><input type="date" value="${p.buyDate || ''}" onchange="portfolio[${i}].buyDate=this.value" style="width:130px"></td>
-    <td><button onclick="portfolio.splice(${i},1);renderConfigTable()" style="background:none;border:none;cursor:pointer;color:var(--text3)">✕</button></td>
-  </tr>`).join('') || '<tr><td colspan="9" style="color:var(--text3);padding:1.5rem;text-align:center">Sin posiciones</td></tr>';
-}
-function addRow() {
-  portfolio.push({ ticker: '', name: '', country: 'US', sector: 'Tecnología', currency: 'EUR', qty: 0, cost: 0, buyDate: '', price: null });
-  renderConfigTable();
-}
-function saveManual() { save(); updateEvoTickers(); updateDivTickers(); loadPrices(); toast('Guardado — actualizando precios'); }
-function clearAll() {
-  if (!confirm('¿Borrar todas las posiciones?')) return;
-  portfolio = [];
-  save();
-  renderConfigTable();
-  renderAll();
-  toast('Posiciones eliminadas');
-}
-function exportCSV() {
-  const rows = [['ticker','nombre','pais','sector','divisa','cantidad','precio_coste','fecha_compra']];
-  portfolio.forEach(p => rows.push([p.ticker, p.name, p.country, p.sector, p.currency, p.qty, p.cost, p.buyDate || '']));
-  const a = document.createElement('a');
-  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(rows.map(r => r.join(',')).join('\n'));
-  a.download = 'cartera_export.csv';
-  a.click();
-}
-
-// ==================== HELPERS ====================
-function updateEvoTickers() {
-  const sel = document.getElementById('evoTicker');
-  sel.innerHTML = '<option value="ALL">Cartera completa</option>' + portfolio.map(p => `<option value="${p.ticker}">${p.ticker}</option>`).join('');
-}
-function updateDivTickers() {
-  const sel = document.getElementById('divTicker');
-  if (sel) sel.innerHTML = '<option value="">–</option>' + portfolio.map(p => `<option value="${p.ticker}">${p.ticker}</option>`).join('');
-}
-function toast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2800);
-}
-
-// ==================== RENDER ALL ====================
-function renderAll() {
-  renderMetrics();
-  renderTable();
-  renderSectorChart();
-  renderCurrencyChart();
-}
-
-// ==================== INIT ====================
-(function init() {
-  console.log('[Portfolio] Init — posiciones:', portfolio.length, portfolio.map(p=>p.ticker));
-  if (portfolio.length) {
-    updateEvoTickers();
-    updateDivTickers();
-    renderAll();
-    // Small delay to let DOM settle
-    setTimeout(() => loadPrices(), 300);
-  } else {
-    console.warn('[Portfolio] No hay posiciones cargadas — revisar DEFAULT_PORTFOLIO y localStorage');
-    renderMetrics();
-    // Force show defaults if something went wrong
-    setTimeout(() => {
-      if (!portfolio.length) {
-        portfolio = DEFAULT_PORTFOLIO.map(p => ({...p}));
-        console.log('[Portfolio] Forzando defaults:', portfolio.length);
-        updateEvoTickers();
-        updateDivTickers();
-        renderAll();
-        loadPrices();
-      }
-    }, 500);
-  }
-})();
-</script>
-</body>
-</html>
